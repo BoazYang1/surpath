@@ -13,9 +13,11 @@ from models.model_MCATPathways import MCATPathways
 from models.model_SurvPath import SurvPath
 from models.model_SurvPath_with_nystrom import SurvPath_with_nystrom
 from models.model_TMIL import TMIL
-from models.model_motcat import MCATPathwaysMotCat
+from models.model_DoubleMediatorSurvPath import DoubleMediatorSurvPath
+# from models.model_motcat import MCATPathwaysMotCat
 from sksurv.metrics import concordance_index_censored, concordance_index_ipcw, brier_score, integrated_brier_score, cumulative_dynamic_auc
 from sksurv.util import Surv
+from tqdm import tqdm
 
 from transformers import (
     get_constant_schedule_with_warmup, 
@@ -211,6 +213,49 @@ def _init_model(args):
             model = SurvPath_with_nystrom(**model_dict)
         else:
             model = SurvPath(**model_dict)
+            
+    elif args.modality == "ccd2_survpath": # 改.......
+        from models.model_CCD import CCD_SurvPath
+        
+        # 构造通路先验概率（基于生物学重要性）
+        pathway_priors = torch.tensor([
+            0.12, 0.15, 0.10, 0.08, 0.12, 0.10, 0.08, 0.09, 0.08, 0.08  # 前10个通路的先验
+            # 可以根据实际通路数量调整
+        ] + [0.01] * (len(args.omic_sizes) - 10))  # 其余通路设较小先验
+        
+        # 归一化
+        pathway_priors = pathway_priors / pathway_priors.sum()
+        
+        model_dict = {
+            'omic_sizes': args.omic_sizes, 
+            'num_classes': args.n_classes,
+            'pathway_prior_probs': pathway_priors,
+        }
+        model = CCD_SurvPath(**model_dict)
+        
+    elif args.modality == "ccd_survpath":
+        from models.model_CCD2 import CCD_SurvPath
+        from utils.pathway_utils import build_pathway_gene_matrix, get_pathway_prior_probs
+        
+        # 构造通路-基因关系矩阵
+        all_gene_names = list(args.dataset_factory.all_modalities["rna"].columns)
+        pathway_gene_matrix = build_pathway_gene_matrix(
+            args.dataset_factory.omic_names, 
+            all_gene_names
+        )
+        
+        model_dict = {
+            'omic_sizes': args.omic_sizes, 
+            'raw_gene_dim': len(all_gene_names),  # 原始基因维度
+            'num_classes': args.n_classes,
+            'pathway_gene_matrix': pathway_gene_matrix,  # 通路-基因关系矩阵
+            # 'omic_names': args.dataset_factory.omic_names
+        }
+        model = CCD_SurvPath(**model_dict)
+        
+    elif args.modality == "double_mediator_survpath":
+        model_dict = {'omic_sizes': args.omic_sizes, 'num_classes': args.n_classes}
+        model = DoubleMediatorSurvPath(**model_dict)
 
     else:
         raise NotImplementedError
@@ -332,20 +377,51 @@ def _unpack_data(modality, device, data):
         y_disc, event_time, censor, clinical_data_list, mask = data[7], data[8], data[9], data[10], data[11]
         mask = mask.to(device)
 
-    elif modality in ["survpath"]:
-
-        data_WSI = data[0].to(device)
+    elif modality in ["survpath", "double_mediator_survpath"]:
+        if modality in ["survpath", "ccd2_survpath"]:
+            data_WSI = data[0].to(device)
+            if data[6][0,0] == 1:
+                mask = None
+            else:
+                mask = data[6].to(device)
+        else:
+            data_WSI = None
+            mask = None
 
         data_omics = []
         for item in data[1][0]:
             data_omics.append(item.to(device))
         
-        if data[6][0,0] == 1:
-            mask = None
-        else:
-            mask = data[6].to(device)
+        
 
         y_disc, event_time, censor, clinical_data_list = data[2], data[3], data[4], data[5]
+        
+    elif modality == "ccd_survpath":
+        # data = (patch_features, raw_gene_tensor, omic_list, label, event_time, c, clinical_data, mask)
+        data_WSI = data[0].to(device)
+        raw_gene_data = data[1].to(device)  # 新增：原始基因数据
+        
+        data_omics = []
+        for item in data[2][0]:  # 分组的通路数据
+            data_omics.append(item.to(device))
+        
+        if data[7][0,0] == 1:
+            mask = None
+        else:
+            mask = data[7].to(device)
+
+        y_disc, event_time, censor, clinical_data_list = data[3], data[4], data[5], data[6]
+        
+        return data_WSI, raw_gene_data, y_disc, event_time, censor, data_omics, clinical_data_list, mask
+    
+        
+    # elif modality == "double_mediator_survpath":
+    #     data_WSI = None
+    #     mask = None
+    #     data_omics = []
+    #     for item in data[1][0]:
+    #         data_omics.append(item.to(device))
+    #     y_disc, event_time, censor, clinical_data_list = data[2], data[3], data[4], data[5]
         
     else:
         raise ValueError('Unsupported modality:', modality)
@@ -386,9 +462,31 @@ def _process_data_and_forward(model, modality, device, data):
             x_omic6=data_omics[5]
             )  
 
-    elif modality == 'survpath':
-
+    elif modality in ['survpath', 'ccd2_survpath']:
         input_args = {"x_path": data_WSI.to(device)}
+        for i in range(len(data_omics)):
+            input_args['x_omic%s' % str(i+1)] = data_omics[i].type(torch.FloatTensor).to(device)
+        input_args["return_attn"] = False
+        out = model(**input_args)
+        
+    elif modality == 'ccd_survpath':
+        data_WSI, raw_gene_data, mask, y_disc, event_time, censor, data_omics, clinical_data_list, mask = _unpack_data(modality, device, data)
+
+        # 构造输入参数
+        input_args = {
+            "x_path": data_WSI.to(device),
+            "raw_gene_expr": raw_gene_data.to(device)  # 新增：原始基因数据
+        }
+        for i in range(len(data_omics)):
+            input_args['x_omic%s' % str(i+1)] = data_omics[i].type(torch.FloatTensor).to(device)
+        input_args["return_attn"] = False
+        
+        out = model(**input_args)
+        
+        return out, y_disc, event_time, censor, clinical_data_list
+
+    elif modality == 'double_mediator_survpath':
+        input_args = {}
         for i in range(len(data_omics)):
             input_args['x_omic%s' % str(i+1)] = data_omics[i].type(torch.FloatTensor).to(device)
         input_args["return_attn"] = False
@@ -475,8 +573,10 @@ def _train_loop_survival(epoch, model, modality, loader, optimizer, scheduler, l
     all_censorships = []
     all_event_times = []
     all_clinical_data = []
+    # progress_bar = tqdm(loader, desc=f"Epoch {epoch}", total=len(loader))
 
     # one epoch
+    # for batch_idx, data in enumerate(progress_bar):
     for batch_idx, data in enumerate(loader):
         
         optimizer.zero_grad()
@@ -496,9 +596,11 @@ def _train_loop_survival(epoch, model, modality, loader, optimizer, scheduler, l
         loss.backward()
         optimizer.step()
         scheduler.step()
+        # progress_bar.set_postfix(loss=f"{loss_value:.4f}")
 
         if (batch_idx % 20) == 0:
             print("batch: {}, loss: {:.3f}".format(batch_idx, loss.item()))
+        
     
     total_loss /= len(loader.dataset)
     all_risk_scores = np.concatenate(all_risk_scores, axis=0)
@@ -621,7 +723,7 @@ def _summary(dataset_factory, model, modality, loader, loss_fn, survival_train=N
     slide_ids = loader.dataset.metadata['slide_id']
     count = 0
     with torch.no_grad():
-        for data in loader:
+        for data in tqdm(loader, desc="Validation Progress"):
 
             data_WSI, mask, y_disc, event_time, censor, data_omics, clinical_data_list, mask = _unpack_data(modality, device, data)
 
@@ -635,9 +737,11 @@ def _summary(dataset_factory, model, modality, loader, loss_fn, survival_train=N
                     x_omic5=data_omics[4], 
                     x_omic6=data_omics[5]
                 )  
-            elif modality == "survpath":
-
-                input_args = {"x_path": data_WSI.to(device)}
+            elif modality in ["survpath", "double_mediator_survpath", "ccd_survpath"]:
+                if modality in ["survpath", "ccd_survpath"]:
+                    input_args = {"x_path": data_WSI.to(device)}
+                else:
+                    input_args = {}
                 for i in range(len(data_omics)):
                     input_args['x_omic%s' % str(i+1)] = data_omics[i].type(torch.FloatTensor).to(device)
                 input_args["return_attn"] = False
@@ -746,9 +850,9 @@ def _step(cur, args, loss_fn, model, optimizer, scheduler, train_loader, val_loa
     for epoch in range(args.max_epochs):
         _train_loop_survival(epoch, model, args.modality, train_loader, optimizer, scheduler, loss_fn)
         # _, val_cindex, _, _, _, _, total_loss = _summary(args.dataset_factory, model, args.modality, val_loader, loss_fn, all_survival)
-        # print('Val loss:', total_loss, ', val_c_index:', val_cindex)
+        print('Val loss:', total_loss, ', val_c_index:', val_cindex)
     # save the trained model
-    torch.save(model.state_dict(), os.path.join(args.results_dir, "s_{}_checkpoint.pt".format(cur)))
+    # torch.save(model.state_dict(), os.path.join(args.results_dir, "s_{}_checkpoint.pt".format(cur)))
     
     results_dict, val_cindex, val_cindex_ipcw, val_BS, val_IBS, val_iauc, total_loss = _summary(args.dataset_factory, model, args.modality, val_loader, loss_fn, all_survival)
     
@@ -801,5 +905,342 @@ def _train_val(datasets, cur, args):
 
     #---> do train val
     results_dict, (val_cindex, val_cindex2, val_BS, val_IBS, val_iauc, total_loss) = _step(cur, args, loss_fn, model, optimizer, lr_scheduler, train_loader, val_loader)
+
+    return results_dict, (val_cindex, val_cindex2, val_BS, val_IBS, val_iauc, total_loss)
+
+def _train_loop_survival_ccd(epoch, model, modality, loader, optimizer, scheduler, loss_fn, alpha=0.1, beta=0.5):
+    """
+    CCD模型的训练循环，包含多任务损失
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.train()
+
+    total_loss = 0.
+    
+    all_risk_scores = []
+    all_censorships = []
+    all_event_times = []
+    all_clinical_data = []
+
+    for batch_idx, data in enumerate(loader):
+        
+        optimizer.zero_grad()
+        
+        data_WSI, raw_gene_data, y_disc, event_time, censor, data_omics, clinical_data_list, mask = _unpack_data(modality, device, data)
+        # Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu! (when checking argument for argument index in method wrapper_CUDA_gather)
+        y_disc = y_disc.to(device)
+        event_time = event_time.to(device)
+        censor = censor.to(device)
+        
+        # 构造输入参数
+        input_args = {"x_path": data_WSI.to(device)} # [B, 4000, dim]
+        for i in range(len(data_omics)):
+            input_args['x_omic%d' % (i+1)] = data_omics[i].type(torch.FloatTensor).to(device) # [B, 4000, dim]
+        input_args["return_attn"] = False
+        input_args["raw_gene_expr"] = raw_gene_data.type(torch.FloatTensor).to(device) 
+        
+        # 获取各分支预测用于多任务学习
+        gene_logits, wsi_logits, fusion_logits = model.forward(return_branches=True, **input_args)
+        # fusion_logits = model.forward(return_branches=False, **input_args)
+        
+        # 计算多任务损失
+        
+        loss_pathway = loss_fn(h=gene_logits, y=y_disc, t=event_time, c=censor)
+        loss_wsi = loss_fn(h=wsi_logits, y=y_disc, t=event_time, c=censor) 
+        loss_fusion = loss_fn(h=fusion_logits, y=y_disc, t=event_time, c=censor)
+        
+        # 总损失（类似原文的多任务设置）
+        total_batch_loss = loss_fusion + alpha * loss_pathway + beta * loss_wsi
+        
+        loss_value = total_batch_loss.item()
+        total_batch_loss = total_batch_loss / y_disc.shape[0]
+        
+        # 计算风险评分
+        risk, _ = _calculate_risk(fusion_logits)
+        
+        all_risk_scores, all_censorships, all_event_times, all_clinical_data = _update_arrays(
+            all_risk_scores, all_censorships, all_event_times, all_clinical_data, 
+            event_time, censor, risk, clinical_data_list
+        )
+
+        total_loss += loss_value 
+
+        total_batch_loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+        if (batch_idx % 20) == 0:
+            print("batch: {}, loss: {:.3f} (Gene: {:.3f}, wsi: {:.3f}, fusion: {:.3f})".format(
+                batch_idx, total_batch_loss.item(), 
+                loss_pathway.item(), loss_wsi.item(), loss_fusion.item()
+            ))
+    
+    total_loss /= len(loader.dataset)
+    all_risk_scores = np.concatenate(all_risk_scores, axis=0)
+    all_censorships = np.concatenate(all_censorships, axis=0)
+    all_event_times = np.concatenate(all_event_times, axis=0)
+    c_index = concordance_index_censored((1-all_censorships).astype(bool), all_event_times, all_risk_scores, tied_tol=1e-08)[0]
+
+    print('Epoch: {}, train_loss: {:.4f}, train_c_index: {:.4f}'.format(epoch, total_loss, c_index))
+
+    return c_index, total_loss
+
+def _summary_ccd(dataset_factory, model, modality, loader, loss_fn, survival_train=None, use_counterfactual=True):
+    """
+    CCD模型的评估函数，支持反事实推理
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval()
+
+    total_loss = 0.
+    all_risk_scores = []
+    all_risk_by_bin_scores = []
+    all_censorships = []
+    all_event_times = []
+    all_clinical_data = []
+    all_logits = []
+    all_slide_ids = []
+
+    slide_ids = loader.dataset.metadata['slide_id']
+    count = 0
+    
+    with torch.no_grad():
+        for data in tqdm(loader, desc="Validation Progress"):
+            data_WSI, raw_gene_expr, y_disc, event_time, censor, data_omics, clinical_data_list, mask = _unpack_data(modality, device, data)
+
+            # 构造输入参数
+            input_args = {"x_path": data_WSI.to(device)}
+            for i in range(len(data_omics)):
+                # print('i:', i)
+                input_args['x_omic%d' % int(i+1)] = data_omics[i].type(torch.FloatTensor).to(device)
+            input_args["return_attn"] = False
+            input_args["raw_gene_expr"] = raw_gene_expr.type(torch.FloatTensor).to(device)
+            if use_counterfactual:
+                # 使用反事实推理进行去偏预测
+                h = model.counterfactual_inference(**input_args)
+            else:
+                # 使用常规预测
+                h = model.forward(**input_args)
+                    
+            if len(h.shape) == 1:
+                h = h.unsqueeze(0)
+            
+            # 放在同一个设备上
+            h = h.to(device)
+            y_disc = y_disc.to(device)
+            event_time = event_time.to(device)
+            censor = censor.to(device)
+            
+            loss = loss_fn(h=h, y=y_disc, t=event_time, c=censor)
+            loss_value = loss.item()
+            loss = loss / y_disc.shape[0]
+
+            risk, risk_by_bin = _calculate_risk(h)
+            all_risk_by_bin_scores.append(risk_by_bin)
+            all_risk_scores, all_censorships, all_event_times, all_clinical_data = _update_arrays(
+                all_risk_scores, all_censorships, all_event_times, all_clinical_data, 
+                event_time, censor, risk, clinical_data_list
+            )
+            all_logits.append(h.detach().cpu().numpy())
+            total_loss += loss_value
+            all_slide_ids.append(slide_ids.values[count])
+            count += 1
+
+    total_loss /= len(loader.dataset)
+    all_risk_scores = np.concatenate(all_risk_scores, axis=0)
+    all_risk_by_bin_scores = np.concatenate(all_risk_by_bin_scores, axis=0)
+    all_censorships = np.concatenate(all_censorships, axis=0)
+    all_event_times = np.concatenate(all_event_times, axis=0)
+    all_logits = np.concatenate(all_logits, axis=0)
+    
+    # 构造患者结果字典
+    patient_results = {}
+    for i in range(len(all_slide_ids)):
+        slide_id = slide_ids.values[i]
+        case_id = slide_id[:12]
+        patient_results[case_id] = {}
+        patient_results[case_id]["time"] = all_event_times[i]
+        patient_results[case_id]["risk"] = all_risk_scores[i]
+        patient_results[case_id]["censorship"] = all_censorships[i]
+        patient_results[case_id]["clinical"] = all_clinical_data[i]
+        patient_results[case_id]["logits"] = all_logits[i]
+    
+    c_index, c_index2, BS, IBS, iauc = _calculate_metrics(loader, dataset_factory, survival_train, all_risk_scores, all_censorships, all_event_times, all_risk_by_bin_scores)
+
+    return patient_results, c_index, c_index2, BS, IBS, iauc, total_loss
+
+def _step_ccd0(cur, args, loss_fn, model, optimizer, scheduler, train_loader, val_loader):
+    """
+    CCD模型的训练和验证主循环
+    """
+    all_survival = _extract_survival_metadata(train_loader, val_loader)
+    best_debiased_results = 0
+    for epoch in range(args.max_epochs):
+        # 使用CCD特定的训练循环
+        _train_loop_survival_ccd(epoch, model, args.modality, train_loader, optimizer, scheduler, loss_fn)
+    
+        # 保存训练好的模型
+        # torch.save(model.state_dict(), os.path.join(args.results_dir, "s_{}_checkpoint.pt".format(cur)))
+    
+        # 每个epoch 输出一次 分别评估常规预测和去偏预测
+        print("=== 评估常规预测 ===")
+        results_dict_regular, val_cindex_regular, val_cindex_ipcw_regular, val_BS_regular, val_IBS_regular, val_iauc_regular, total_loss_regular = _summary_ccd(
+            args.dataset_factory, model, args.modality, val_loader, loss_fn, all_survival, use_counterfactual=False
+        )
+        
+        print("=== 评估去偏预测 ===")
+        results_dict_debiased, val_cindex_debiased, val_cindex_ipcw_debiased, val_BS_debiased, val_IBS_debiased, val_iauc_debiased, total_loss_debiased = _summary_ccd(
+            args.dataset_factory, model, args.modality, val_loader, loss_fn, all_survival, use_counterfactual=True
+        )
+        # 将最好的去偏预测结果 保存起来并 return
+        if val_cindex_debiased > best_debiased_results:
+            best_debiased_results = val_cindex_debiased
+            best_debiased_results_dict = results_dict_debiased
+            best_debiased_results_val_cindex = val_cindex_debiased
+            best_debiased_results_val_cindex_ipcw = val_cindex_ipcw_debiased
+            best_debiased_results_val_BS = val_BS_debiased
+            best_debiased_results_val_IBS = val_IBS_debiased
+            best_debiased_results_val_iauc = val_iauc_debiased
+            best_debiased_results_total_loss = total_loss_debiased
+            
+        print('best_debiased_results in epoch {}: Regular C-index: {:.4f} | Debiased C-index: {:.4f} | Improvement: {:.4f}'.format(
+            epoch,
+            best_val_cindex_regular, val_cindex_debiased, val_cindex_debiased - val_cindex_regular
+        ))
+        
+    return best_debiased_results_dict, (best_debiased_results_val_cindex, best_debiased_results_val_cindex_ipcw, best_debiased_results_val_BS, best_debiased_results_val_IBS, best_debiased_results_val_iauc, best_debiased_results_total_loss)
+
+    # 返回去偏后的结果作为主要结果
+    # return results_dict_debiased, (val_cindex_debiased, val_cindex_ipcw_debiased, val_BS_debiased, val_IBS_debiased, val_iauc_debiased, total_loss_debiased)
+
+def _step_ccd(cur, args, loss_fn, model, optimizer, scheduler, train_loader, val_loader):
+    """
+    CCD模型的训练和验证主循环
+    """
+    all_survival = _extract_survival_metadata(train_loader, val_loader)
+    
+    # 初始化最佳结果追踪（以去偏结果为准）
+    best_debiased_cindex = 0
+    
+    # 初始化最佳去偏结果对应的所有变量
+    best_debiased_results_dict = None
+    best_debiased_results_val_cindex = 0
+    best_debiased_results_val_cindex_ipcw = 0
+    best_debiased_results_val_BS = 0
+    best_debiased_results_val_IBS = 0
+    best_debiased_results_val_iauc = 0
+    best_debiased_results_total_loss = 0
+    
+    # 初始化最佳去偏结果对应的常规预测结果
+    best_regular_results_dict = None
+    best_regular_results_val_cindex = 0
+    best_regular_results_val_cindex_ipcw = 0
+    best_regular_results_val_BS = 0
+    best_regular_results_val_IBS = 0
+    best_regular_results_val_iauc = 0
+    best_regular_results_total_loss = 0
+    
+    for epoch in range(args.max_epochs):
+        print(f"\n=== Epoch {epoch+1}/{args.max_epochs} ===")
+        
+        # 使用CCD特定的训练循环
+        _train_loop_survival_ccd(epoch, model, args.modality, train_loader, optimizer, scheduler, loss_fn)
+    
+        # 保存训练好的模型
+        # torch.save(model.state_dict(), os.path.join(args.results_dir, "s_{}_checkpoint.pt".format(cur)))
+    
+        # 每个epoch 输出一次 分别评估常规预测和去偏预测
+        print("=== 评估常规预测 ===")
+        results_dict_regular, val_cindex_regular, val_cindex_ipcw_regular, val_BS_regular, val_IBS_regular, val_iauc_regular, total_loss_regular = _summary_ccd(
+            args.dataset_factory, model, args.modality, val_loader, loss_fn, all_survival, use_counterfactual=False
+        )
+        
+        # 输出常规预测结果
+        # print(f"常规预测结果 - C-index: {val_cindex_regular:.4f}, C-index(IPCW): {val_cindex_ipcw_regular:.4f}, "
+        #       f"BS: {val_BS_regular:.4f}, IBS: {val_IBS_regular:.4f}, iAUC: {val_iauc_regular:.4f}, Loss: {total_loss_regular:.4f}")
+        
+        print("=== 评估去偏预测 ===")
+        results_dict_debiased, val_cindex_debiased, val_cindex_ipcw_debiased, val_BS_debiased, val_IBS_debiased, val_iauc_debiased, total_loss_debiased = _summary_ccd(
+            args.dataset_factory, model, args.modality, val_loader, loss_fn, all_survival, use_counterfactual=True
+        )
+        
+        # 输出去偏预测结果
+        # print(f"去偏预测结果 - C-index: {val_cindex_debiased:.4f}, C-index(IPCW): {val_cindex_ipcw_debiased:.4f}, "
+        #       f"BS: {val_BS_debiased:.4f}, IBS: {val_IBS_debiased:.4f}, iAUC: {val_iauc_debiased:.4f}, Loss: {total_loss_debiased:.4f}")
+        
+        # 计算改进幅度
+        improvement = val_cindex_debiased - val_cindex_regular
+        print(f"去偏改进: {improvement:.4f} (去偏 - 常规)")
+        
+        # 以去偏预测结果为准，当找到更好的去偏结果时，同时保存该epoch的常规预测和去偏预测结果
+        if val_cindex_debiased > best_debiased_cindex:
+            best_debiased_cindex = val_cindex_debiased
+            
+            # 保存最佳去偏结果
+            best_debiased_results_dict = results_dict_debiased
+            best_debiased_results_val_cindex = val_cindex_debiased
+            best_debiased_results_val_cindex_ipcw = val_cindex_ipcw_debiased
+            best_debiased_results_val_BS = val_BS_debiased
+            best_debiased_results_val_IBS = val_IBS_debiased
+            best_debiased_results_val_iauc = val_iauc_debiased
+            best_debiased_results_total_loss = total_loss_debiased
+            
+            # 同时保存该epoch对应的常规预测结果
+            best_regular_results_dict = results_dict_regular
+            best_regular_results_val_cindex = val_cindex_regular
+            best_regular_results_val_cindex_ipcw = val_cindex_ipcw_regular
+            best_regular_results_val_BS = val_BS_regular
+            best_regular_results_val_IBS = val_IBS_regular
+            best_regular_results_val_iauc = val_iauc_regular
+            best_regular_results_total_loss = total_loss_regular
+            
+            print(f"*** 新的最佳去偏结果! Epoch {epoch+1} - 去偏C-index: {val_cindex_debiased:.4f}, 对应常规C-index: {val_cindex_regular:.4f} ***")
+            
+        # 输出当前最佳结果比较（同一epoch的常规vs去偏）
+        if best_debiased_cindex > 0:  # 确保已有最佳结果
+            improvement = best_debiased_results_val_cindex - best_regular_results_val_cindex
+            print(f'当前最佳模型结果 - 常规C-index: {best_regular_results_val_cindex:.4f} | 去偏C-index: {best_debiased_results_val_cindex:.4f} | 改进: {improvement:.4f}')
+        print("-" * 80)
+        
+    # 训练结束后输出最终总结（同一模型状态下的常规vs去偏比较）
+    print(f"\n=== 训练完成总结 ===")
+    if best_debiased_cindex > 0:
+        final_improvement = best_debiased_results_val_cindex - best_regular_results_val_cindex
+        print(f'最佳模型（以去偏结果为准）:')
+        print(f'  常规预测 C-index: {best_regular_results_val_cindex:.4f}')
+        print(f'  去偏预测 C-index: {best_debiased_results_val_cindex:.4f}')
+        print(f'  去偏改进幅度: {final_improvement:.4f}')
+        print(f'  改进百分比: {(final_improvement/best_regular_results_val_cindex*100):.2f}%')
+    else:
+        print("未找到有效的去偏预测结果")
+    
+    return best_debiased_results_dict, (best_debiased_results_val_cindex, best_debiased_results_val_cindex_ipcw, best_debiased_results_val_BS, best_debiased_results_val_IBS, best_debiased_results_val_iauc, best_debiased_results_total_loss)
+
+def _train_val_ccd(datasets, cur, args):
+    """
+    CCD模型的完整训练验证流程
+    """
+    # 获取数据分割
+    train_split, val_split = _get_splits(datasets, cur, args)
+    
+    # 初始化损失函数
+    loss_fn = _init_loss_function(args)
+
+    # 初始化CCD模型
+    model = _init_model(args)
+    
+    # 初始化优化器
+    optimizer = _init_optim(args, model)
+
+    # 初始化数据加载器
+    train_loader, val_loader = _init_loaders(args, train_split, val_split)
+
+    # 学习率调度器
+    lr_scheduler = _get_lr_scheduler(args, optimizer, train_loader)
+
+    # 执行训练验证
+    results_dict, (val_cindex, val_cindex2, val_BS, val_IBS, val_iauc, total_loss) = _step_ccd(
+        cur, args, loss_fn, model, optimizer, lr_scheduler, train_loader, val_loader
+    )
 
     return results_dict, (val_cindex, val_cindex2, val_BS, val_IBS, val_iauc, total_loss)
